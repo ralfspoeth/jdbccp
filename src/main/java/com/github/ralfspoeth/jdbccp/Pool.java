@@ -1,8 +1,6 @@
 package com.github.ralfspoeth.jdbccp;
 
-import java.lang.reflect.InvocationHandler;
 import java.sql.*;
-import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.Condition;
@@ -10,6 +8,17 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
 public class Pool {
+
+    public void shutdown() {
+        lock.lock();
+        try {
+            stopped = true;
+            connectionsRequired.signal();
+        }
+        finally {
+            lock.unlock();
+        }
+    }
 
     private class ForwardingConnection implements Connection {
         public Statement createStatement() throws SQLException {
@@ -274,8 +283,8 @@ public class Pool {
 
         public void close() throws SQLException {
             try {
-                for(var s: statements) {
-                    if(!s.isClosed()) {
+                for (var s : statements) {
+                    if (!s.isClosed()) {
                         s.close();
                     }
                 }
@@ -287,7 +296,7 @@ public class Pool {
             } finally {
                 statements.clear();
                 closed = true;
-                if(!conn.isClosed() && conn.isValid(0)) {
+                if (!conn.isClosed() && conn.isValid(0)) {
                     pool.add(this);
                 }
             }
@@ -305,22 +314,108 @@ public class Pool {
 
     private final Lock lock = new ReentrantLock();
     private final Condition connectionsAvailable = lock.newCondition();
+    private final Condition connectionsRequired = lock.newCondition();
 
     private final Deque<ForwardingConnection> pool = new LinkedList<>();
 
+    private boolean checkConnectionsAvailable() {
+        return !pool.isEmpty();
+    }
+
+
+    private volatile boolean stopped = false;
+
     public Connection get() throws InterruptedException {
-        Connection conn = null;
         try {
             lock.lock();
-            while(pool.isEmpty()) {
+            connectionsRequired.signal();
+            while (pool.isEmpty()) {
+                connectionsRequired.signal();
                 connectionsAvailable.await();
             }
             return pool.removeFirst();
-        }
-        finally {
+        } finally {
+            connectionsRequired.signal();
             lock.unlock();
         }
     }
 
-    public void release()
+    private void release(ForwardingConnection conn) {
+        lock.lock();
+        try {
+            pool.add(conn);
+            connectionsAvailable.signal();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private final Driver jdbcDriver;
+    private final String jdbcUrl;
+    private final Properties info;
+
+    private Pool(Driver drv, String jdbcUrl, Properties info) {
+        this.jdbcDriver = drv;
+        this.jdbcUrl = jdbcUrl;
+        this.info = info;
+    }
+
+    private Connection connect() throws SQLException {
+        return jdbcDriver.connect(jdbcUrl, info);
+    }
+
+    private boolean createNewPooledConnection() throws SQLException {
+        return pool.add(new ForwardingConnection(connect()));
+    }
+
+    private class Producer implements Runnable {
+        @Override
+        public void run() {
+            while(!stopped) {
+                lock.lock();
+                try {
+                    while(!pool.isEmpty()) {
+                        connectionsRequired.await();
+                    }
+                    try {
+                        createNewPooledConnection();
+                    } catch (SQLException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+                catch (InterruptedException iex) {
+                    Thread.currentThread().interrupt();
+                    stopped = true;
+                }
+                finally {
+                    lock.unlock();
+                }
+            }
+        }
+    }
+
+    private Thread createProducer(String jdbcUrl) {
+        return Thread.ofVirtual()
+                .name("connection producer for " + jdbcUrl)
+                .start(new Producer());
+    }
+
+    public static Pool start(String jdbcUrl, Properties props) throws SQLException {
+        // copy properties
+        var info = new Properties();
+        props.stringPropertyNames().forEach(e -> info.setProperty(e, props.getProperty(e)));
+        // driver
+        Driver jdbcDriver = DriverManager.getDriver(jdbcUrl);
+
+        if (jdbcDriver == null) {
+            throw new SQLException("No suitable driver for " + jdbcUrl);
+        }
+
+        // instantiate pool
+        var p = new Pool(jdbcDriver, jdbcUrl, info);
+        var thread = p.createProducer(jdbcUrl);
+
+        // return pool
+        return p;
+    }
 }
