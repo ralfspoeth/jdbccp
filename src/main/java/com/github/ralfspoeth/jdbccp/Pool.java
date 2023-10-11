@@ -9,13 +9,16 @@ import java.util.concurrent.locks.ReentrantLock;
 
 public class Pool {
 
+    /**
+     * No more connections required; effectively
+     * stops the connection producer thread.
+     */
     public void shutdown() {
         lock.lock();
         try {
             stopped = true;
             connectionsRequired.signal();
-        }
-        finally {
+        } finally {
             lock.unlock();
         }
     }
@@ -322,20 +325,21 @@ public class Pool {
         return !pool.isEmpty();
     }
 
-
-    private volatile boolean stopped = false;
+    private boolean checkConnectionsRequired() {
+        return pool.isEmpty() || queued > 0;
+    }
 
     public Connection get() throws InterruptedException {
         try {
             lock.lock();
+            queued++;
             connectionsRequired.signal();
-            while (pool.isEmpty()) {
-                connectionsRequired.signal();
+            while (!checkConnectionsAvailable()) {
                 connectionsAvailable.await();
             }
+            queued--;
             return pool.removeFirst();
         } finally {
-            connectionsRequired.signal();
             lock.unlock();
         }
     }
@@ -350,9 +354,15 @@ public class Pool {
         }
     }
 
+    /// connection properties
     private final Driver jdbcDriver;
     private final String jdbcUrl;
     private final Properties info;
+
+    // internal state
+    private int queued = 0;
+    private volatile boolean stopped = false;
+
 
     private Pool(Driver drv, String jdbcUrl, Properties info) {
         this.jdbcDriver = drv;
@@ -371,28 +381,30 @@ public class Pool {
     private class Producer implements Runnable {
         @Override
         public void run() {
-            while(!stopped) {
+            while (!stopped) {
                 lock.lock();
                 try {
-                    while(!pool.isEmpty()) {
-                        connectionsRequired.await();
+                    while (!checkConnectionsRequired()) {
+                        try {
+                            connectionsRequired.await();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
                     }
                     try {
-                        createNewPooledConnection();
-                    } catch (SQLException e) {
-                        throw new RuntimeException(e);
+                        if (createNewPooledConnection())
+                            connectionsAvailable.signal();
+                        else stopped = true;
+                    } catch (SQLException sqlEx) {
+                        throw new RuntimeException(sqlEx);
                     }
-                }
-                catch (InterruptedException iex) {
-                    Thread.currentThread().interrupt();
-                    stopped = true;
-                }
-                finally {
+                } finally {
                     lock.unlock();
                 }
             }
         }
     }
+
 
     private Thread createProducer(String jdbcUrl) {
         return Thread.ofVirtual()
